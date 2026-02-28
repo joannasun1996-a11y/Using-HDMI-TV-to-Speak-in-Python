@@ -1,17 +1,72 @@
-import os
-import time
 
-while True:
-    user_input = input("You: ")
+import queue
+import json
+import sounddevice as sd
+from vosk import Model, KaldiRecognizer
+import subprocess
+import requests
 
-    time.sleep(0.2)  # tiny delay to prevent clipping
+# -------- CONFIG --------
+MODEL_PATH = "vosk-model-en-us-0.22"
+MIC_DEVICE = 11
+SAMPLE_RATE = 16000
+OLLAMA_MODEL = "qwen2:0.5b"
+# ------------------------
 
-    os.system(f'echo "{user_input}" | espeak -s 160 -a 200 --stdout | aplay -D plughw:0,3')
+q = queue.Queue()
 
-    response = os.popen(f'ollama run deepseek-r1:1.5b "{user_input}"').read()
+def callback(indata, frames, time, status):
+    if status:
+        print(status)
+    q.put(bytes(indata))
 
-    print("DeepSeek:", response)
 
-    time.sleep(0.2)
+def ask_local_llm(text):
+    url = "http://localhost:11434/api/generate"
 
-    os.system(f'echo "{response}" | espeak -s 160 -a 200 --stdout | aplay -D plughw:0,3')
+    prompt = "You are a helpful AI voice assistant.\n"
+    prompt += "Answer clearly and briefly.\n\n"
+    prompt += "User: " + text + "\n"
+    prompt += "Assistant:"
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False
+    }
+    response = requests.post(url, json=payload)
+
+    if response.status_code != 200:
+        print("Ollama Error:", response.text)
+        return "There was an error."
+
+    return response.json()["response"].strip()
+
+
+# Load Vosk model
+model = Model(MODEL_PATH)
+rec = KaldiRecognizer(model, SAMPLE_RATE)
+
+with sd.RawInputStream(device=MIC_DEVICE,
+                       samplerate=SAMPLE_RATE,
+                       blocksize=8000,
+                       dtype='int16',
+                       channels=1,
+                       callback=callback):
+
+    print("Listening... Speak now")
+
+    while True:
+        data = q.get()
+
+        if rec.AcceptWaveform(data):
+            result = json.loads(rec.Result())
+            text = result.get("text", "").strip()
+
+            if text != "":
+                print("You said:", text)
+
+                reply = ask_local_llm(text)
+                print("Assistant:", reply)
+
+                subprocess.run(["espeak-ng", reply])
